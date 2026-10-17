@@ -1,93 +1,112 @@
 # Autonomous Sensor Fusion Navigation System
 
-An embedded autonomous navigation system that fuses multiple sensor inputs to perform real-time obstacle detection and decision-making on a microcontroller platform.
+[![firmware-ci](https://github.com/adheeshram/Autonomous-Sensor-Fusion-Navigation-System/actions/workflows/ci.yml/badge.svg)](https://github.com/adheeshram/Autonomous-Sensor-Fusion-Navigation-System/actions/workflows/ci.yml)
 
-This project focuses on reliability, low-latency response, and embedded system constraints, with applications in autonomous navigation and assistive sensing.
+A resource-conscious embedded navigation stack that combines ultrasonic and infrared ranging to detect obstacles, estimate approach risk, and produce fail-safe motion guidance on Arduino-class hardware.
 
----
+Version 3 separates hardware I/O from a portable C++ navigation core. The same filtering, fusion, health monitoring, and decision logic that runs on the microcontroller is compiled and tested natively in CI.
 
-## System Overview
+## What the system does
 
-The system continuously samples distance data from multiple ultrasonic sensors, filters noisy readings, and fuses the results into a single proximity estimate. A real-time decision layer evaluates confidence and distance thresholds to trigger navigation responses when unsafe conditions are detected.
+- Rejects impulsive noise with a rolling median, median-absolute-deviation gate, and exponential smoothing.
+- Tracks sensor health over time, down-weights unreliable channels, and ignores stale measurements.
+- Fuses each left/right sensor pair using modality reliability, health, and freshness weights.
+- Preserves the closest occupied sector instead of averaging a dangerous near obstacle into the background.
+- Estimates closing speed and time to collision (TTC), allowing the controller to react before a fixed distance threshold is crossed.
+- Applies a hysteretic `CLEAR → CAUTION → EMERGENCY` safety state machine with a fail-safe `DEGRADED` mode.
+- Emits newline-delimited JSON telemetry for replay and offline analysis.
 
-Key features:
-- Multi-sensor distance measurement  
-- Median filtering for noise reduction  
-- Confidence-weighted sensor fusion  
-- Real-time embedded decision logic  
+## Architecture
 
----
+```mermaid
+flowchart LR
+    US[2× ultrasonic] --> IO[Hardware acquisition]
+    IR[2× infrared] --> IO
+    IO --> F[Per-sensor robust filters]
+    F --> H[Health and freshness scoring]
+    H --> SF[Left/right sector fusion]
+    SF --> R[Range + closing-rate estimate]
+    R --> SM[Hysteretic safety state machine]
+    SM --> O[LED / buzzer / speed limit]
+    SM --> T[JSON telemetry]
+```
 
-## Hardware & Software Stack
+The core uses fixed-size buffers and no heap allocation. Four seven-sample filter windows use approximately 112 bytes for measurement storage, keeping the design suitable for an ATmega328P-class board. See [architecture.md](docs/architecture.md) for the data flow and design rationale.
 
-**Hardware**
-- Arduino microcontroller  
-- Ultrasonic distance sensors (HC-SR04 or equivalent)  
-- Breadboard and jumper wires  
-- Alert output (buzzer or LED)  
+## Safety states
 
-**Software**
-- Embedded C++ (Arduino)
-- Arduino IDE
-- Serial debugging for real-time monitoring
+| State | Entry condition | Recommended output |
+|---|---|---|
+| `CLEAR` | Valid estimate beyond caution limits | 100% speed limit, alert off |
+| `CAUTION` | Range ≤ 60 cm or TTC ≤ 2.5 s | 45% speed limit, intermittent alert |
+| `EMERGENCY` | Range ≤ 25 cm or TTC ≤ 0.8 s | 0% speed limit, continuous alert |
+| `DEGRADED` | Estimate missing or confidence < 0.22 | 25% speed limit, fault alert |
 
----
+Escalation is immediate. De-escalation requires three consecutive readings beyond the active threshold plus an 8 cm release margin, which prevents state chatter around a boundary. These defaults are centralized in [`Config.h`](include/navigation/Config.h).
 
-## Core Logic
+## Hardware
 
-1. Each sensor samples multiple distance readings per update cycle  
-2. Median filtering removes outliers and reduces measurement noise  
-3. Filtered readings are assigned confidence scores based on proximity  
-4. A weighted fusion algorithm computes a single distance estimate  
-5. Decision logic triggers an alert when the fused distance falls below a defined safety threshold  
+- Arduino Uno or compatible ATmega328P board
+- 2× HC-SR04 ultrasonic sensors
+- 2× analog Sharp-style IR distance sensors
+- Active/passive buzzer and status LED
+- Appropriate resistors, power supply, breadboard, and wiring
 
-The implementation is designed to maintain consistent real-time performance under resource constraints.
+The default pin map and electrical notes are in [hardware.md](docs/hardware.md). The IR conversion curve in `src/main.cpp` is an approximation and should be calibrated for the exact sensor model before real-world use.
 
----
+## Build and test
 
-## Testing & Evaluation
+### Firmware with PlatformIO
 
-The system was evaluated through repeated trials across varying distances and sensor conditions.
+```bash
+pio run -e uno
+pio run -e uno -t upload
+pio device monitor -b 115200
+```
 
-- Conducted 40+ test trials across close- and mid-range distances  
-- Evaluated behavior during partial sensor dropouts and noisy readings  
-- Verified stable alert triggering within unsafe proximity ranges  
-- Adjusted thresholds to reduce false positives while prioritizing safety  
+### Portable core with CMake
 
-Test results are provided in `test_results.csv`.
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
 
----
+The native suite covers robust filtering, health recovery, sensor dropout, directional fusion, transition hysteresis, TTC-based escalation, and degraded-mode behavior. GitHub Actions runs both the native suite and an Arduino Uno firmware build on every push and pull request.
 
-## Repository Contents
+## Telemetry and replay
 
-├── navigation_system.ino
-├── test_results.csv
-└── implementation_notes.md
+Firmware output is JSON Lines, so every cycle can be stored without a custom decoder:
 
+```json
+{"t_ms":1250,"sensors_cm":[41.2,83.0,43.5,80.4],"health":[1.00,1.00,0.97,0.95],"distance_cm":42.2,"confidence":0.88,"state":"CAUTION","direction":"LEFT","ttc_s":1.74,"speed_limit_pct":45}
+```
 
-- `navigation_system.ino` contains the complete embedded implementation  
-- `test_results.csv` includes sample performance data from experimental trials  
-- `implementation_notes.md` documents design decisions, limitations, and future improvements  
+Capture and summarize a run:
 
----
+```bash
+pio device monitor -b 115200 | tee run.jsonl
+python3 tools/analyze_telemetry.py run.jsonl --csv run.csv
+```
 
-## Limitations
+The analyzer reports cycle timing, state occupancy, minimum range, confidence, sensor availability, and TTC events, and can flatten valid records to CSV for plotting.
 
-- Distance-based sensing only (no object classification)  
-- Ultrasonic accuracy is affected by surface material and angle  
-- Object velocity is not currently considered  
+## Repository layout
 
----
+```text
+include/navigation/   Portable interfaces and configuration
+src/                  Navigation core and Arduino hardware adapter
+test/native/          Host-compiled behavioral tests
+tools/                Telemetry analysis utility
+docs/                 Architecture, hardware, and validation notes
+.github/workflows/    Native test and firmware-build CI
+test_results.csv      Original bench observations retained as project history
+```
 
-## Future Improvements
+## Validation status
 
-- Adaptive distance thresholds based on environmental conditions  
-- Additional sensor modalities (IR, IMU)  
-- Statistical confidence modeling  
-- Integration with motor control for autonomous navigation  
-
----
+The software paths above are automatically tested, but this repository is not a certified safety controller. The historical observations in `test_results.csv` are retained from the original project; new hardware claims should be added only after a documented bench run. A repeatable test protocol is provided in [validation.md](docs/validation.md).
 
 ## License
 
-This project is released for educational and research purposes.
+MIT — see [LICENSE](LICENSE).
